@@ -36,28 +36,40 @@ export async function handler(event) {
       Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
       'Content-Type': 'application/json'
     };
-    const historyUrl = `${base}/rest/v1/chat_messages?anonymous_session_id=eq.${encodeURIComponent(sessionId)}&profile_id=eq.${encodeURIComponent(profileId)}&select=role,content&order=created_at.desc&limit=16`;
+    const historyUrl = `${base}/rest/v1/chat_messages?anonymous_session_id=eq.${encodeURIComponent(sessionId)}&profile_id=eq.${encodeURIComponent(profileId)}&select=id,role,content&order=created_at.desc&limit=12`;
     const historyRes = await fetch(historyUrl, { headers: dbHeaders });
     if (!historyRes.ok) {
       console.error('Supabase history request failed:', historyRes.status, await historyRes.text());
       return json(502, { error: 'Chat history database error. Check the Supabase table and service-role key.' });
     }
     const history = (await historyRes.json()).reverse();
+
+    // Persistent per-session, per-profile memory. Missing table is non-fatal during rollout.
+    let memorySummary = '';
+    const memoryUrl = `${base}/rest/v1/chat_memories?anonymous_session_id=eq.${encodeURIComponent(sessionId)}&profile_id=eq.${encodeURIComponent(profileId)}&select=summary&limit=1`;
+    const memoryRes = await fetch(memoryUrl, { headers: dbHeaders });
+    if (memoryRes.ok) {
+      const memoryRows = await memoryRes.json();
+      memorySummary = String(memoryRows?.[0]?.summary || '').slice(0, 5000);
+    } else {
+      console.error('Supabase memory read failed:', memoryRes.status, await memoryRes.text());
+    }
+
     const langName = ({ en: 'English', hi: 'Hindi', mr: 'Marathi' })[language] || 'English';
-    const systemText = `You are ${profileName}, a fictional adult Indian chat companion aged 21+. Personality: ${personality}. Speak naturally and warmly in ${langName}. You are a fictional character; never claim to be a real human or to meet the user. Do not request money, passwords, OTPs, or sensitive personal data. Keep replies conversational, affectionate but respectful, and concise (usually 1-4 sentences). Do not mention being an AI unless directly asked.`;
+    const systemText = `You are ${profileName}, a fictional adult Indian chat companion aged 21+. Personality: ${personality}. Speak naturally and warmly in ${langName}. You are a fictional character; never claim to be a real human or to meet the user. Do not request money, passwords, OTPs, or sensitive personal data. Keep replies conversational, affectionate but respectful, and concise (usually 1-2 short sentences). Do not mention being an AI unless directly asked.\n\nLong-term memory about this user in this profile (use naturally when relevant; do not repeat it mechanically): ${memorySummary || 'No saved personal facts yet.'}\nRemember important stable preferences, names, ongoing topics and facts the user shares. Do not invent facts.`;
     const contents = [
       ...history.map(row => ({ role: row.role === 'assistant' ? 'model' : 'user', parts: [{ text: row.content }] })),
       { role: 'user', parts: [{ text: message }] }
     ];
 
-    const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+    const model = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
     const aiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
       method: 'POST',
       headers: { 'x-goog-api-key': GEMINI_API_KEY, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: systemText }] },
         contents,
-        generationConfig: { temperature: 0.85, maxOutputTokens: 250 }
+        generationConfig: { temperature: 0.7, maxOutputTokens: 120 }
       })
     });
     const aiData = await aiRes.json().catch(() => ({}));
@@ -81,6 +93,42 @@ export async function handler(event) {
     if (!saveRes.ok) {
       console.error('Supabase save request failed:', saveRes.status, await saveRes.text());
       return json(502, { error: 'Reply was generated, but chat history could not be saved. Check the Supabase table permissions and columns.' });
+    }
+
+    // Refresh the durable memory periodically, not on every turn, to avoid slowing normal replies.
+    // Every 8 stored messages (4 user/assistant exchanges), ask Gemini to compact stable facts.
+    const newestId = Number(history[history.length - 1]?.id || 0);
+    const shouldRefreshMemory = history.length === 0 || (newestId > 0 && newestId % 8 === 0);
+    if (shouldRefreshMemory) {
+      try {
+        const memoryInput = [
+          ...history.map(row => `${row.role}: ${row.content}`),
+          `user: ${message}`,
+          `assistant: ${reply}`
+        ].join('\n').slice(-9000);
+        const memoryPrompt = `Update a compact long-term memory for this user's conversations with ${profileName}. Keep only useful stable facts: preferred name, interests, preferences, important ongoing topics, and relevant details the user explicitly shared. Do not infer sensitive traits, do not include guesses, and remove outdated or contradicted facts. Return plain text only, maximum 120 words. Existing memory: ${memorySummary || '(none)'}\nRecent conversation:\n${memoryInput}`;
+        const memoryAiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+          method: 'POST',
+          headers: { 'x-goog-api-key': GEMINI_API_KEY, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: memoryPrompt }] }], generationConfig: { temperature: 0.2, maxOutputTokens: 180 } })
+        });
+        if (memoryAiRes.ok) {
+          const memoryAiData = await memoryAiRes.json();
+          const newSummary = (memoryAiData.candidates?.[0]?.content?.parts || []).map(part => part.text || '').join('').trim().slice(0, 5000);
+          if (newSummary) {
+            const upsertRes = await fetch(`${base}/rest/v1/chat_memories?on_conflict=anonymous_session_id,profile_id`, {
+              method: 'POST',
+              headers: { ...dbHeaders, Prefer: 'resolution=merge-duplicates,return=minimal' },
+              body: JSON.stringify({ anonymous_session_id: sessionId, profile_id: profileId, summary: newSummary, updated_at: new Date().toISOString() })
+            });
+            if (!upsertRes.ok) console.error('Supabase memory save failed:', upsertRes.status, await upsertRes.text());
+          }
+        } else {
+          console.error('Gemini memory update failed:', memoryAiRes.status, (await memoryAiRes.text()).slice(0, 800));
+        }
+      } catch (memoryError) {
+        console.error('Memory update error:', memoryError);
+      }
     }
     return json(200, { reply });
   } catch (error) {
