@@ -6,6 +6,33 @@ const headers = {
 };
 const json = (statusCode, body) => ({ statusCode, headers, body: JSON.stringify(body) });
 
+// Try the fast, low-cost model first, then automatically fail over if Google
+// reports temporary overload or rate limiting. No extra attempt is made when
+// the request itself is invalid or the API key is rejected.
+async function generateWithFallback(apiKey, models, payload, label = 'chat') {
+  let lastResult = null;
+  for (const model of [...new Set(models.filter(Boolean))]) {
+    try {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+        method: 'POST',
+        headers: { 'x-goog-api-key': apiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await response.json().catch(() => ({}));
+      if (response.ok) return { ok: true, model, data };
+      lastResult = { ok: false, status: response.status, data, model };
+      console.error(`Gemini ${label} model ${model} failed:`, response.status, JSON.stringify(data).slice(0, 1000));
+      if ([400, 401, 403].includes(response.status)) break;
+      // 404 may mean a model is unavailable for this API project; try backup.
+      // 429/5xx are commonly temporary capacity or quota errors; try backup.
+    } catch (error) {
+      lastResult = { ok: false, status: 503, data: { error: { message: String(error) } }, model };
+      console.error(`Gemini ${label} network error for ${model}:`, error);
+    }
+  }
+  return lastResult || { ok: false, status: 503, data: {}, model: '' };
+}
+
 export async function handler(event) {
   if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers };
   if (event.httpMethod !== 'POST') return json(405, { error: 'Use POST to send a chat message.' });
@@ -62,23 +89,23 @@ export async function handler(event) {
       { role: 'user', parts: [{ text: message }] }
     ];
 
-    const model = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
-    const aiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-      method: 'POST',
-      headers: { 'x-goog-api-key': GEMINI_API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: systemText }] },
-        contents,
-        generationConfig: { temperature: 0.7, maxOutputTokens: 120 }
-      })
-    });
-    const aiData = await aiRes.json().catch(() => ({}));
-    if (!aiRes.ok) {
-      console.error('Gemini API request failed:', aiRes.status, JSON.stringify(aiData).slice(0, 1200));
-      if (aiRes.status === 400 || aiRes.status === 403) return json(502, { error: 'Gemini rejected the API key or request. Check that the key is valid and Gemini API is enabled in Google AI Studio.' });
-      if (aiRes.status === 429) return json(429, { error: 'Gemini free-tier request limit reached. Please wait a little and try again.' });
-      return json(502, { error: 'Gemini chat service is temporarily unavailable. Please try again shortly.' });
+    const models = [
+      process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite',
+      process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.8-flash'
+    ];
+    const aiResult = await generateWithFallback(GEMINI_API_KEY, models, {
+      systemInstruction: { parts: [{ text: systemText }] },
+      contents,
+      generationConfig: { temperature: 0.7, maxOutputTokens: 120 }
+    }, 'chat');
+    if (!aiResult?.ok) {
+      const status = aiResult?.status || 503;
+      if ([400, 401, 403].includes(status)) return json(502, { error: 'Gemini rejected the API key or request. Check that the key is valid and Gemini API is enabled in Google AI Studio.' });
+      if (status === 429) return json(429, { error: 'Gemini is rate-limited on the available models. Please wait a little and try again.' });
+      return json(502, { error: 'Gemini chat service is temporarily unavailable on both models. Please try again shortly.' });
     }
+    const activeModel = aiResult.model;
+    const aiData = aiResult.data;
     const reply = (aiData.candidates?.[0]?.content?.parts || []).map(part => part.text || '').join('').trim();
     if (!reply) return json(502, { error: 'Gemini returned an empty reply. Please send your message again.' });
 
@@ -107,13 +134,12 @@ export async function handler(event) {
           `assistant: ${reply}`
         ].join('\n').slice(-9000);
         const memoryPrompt = `Update a compact long-term memory for this user's conversations with ${profileName}. Keep only useful stable facts: preferred name, interests, preferences, important ongoing topics, and relevant details the user explicitly shared. Do not infer sensitive traits, do not include guesses, and remove outdated or contradicted facts. Return plain text only, maximum 120 words. Existing memory: ${memorySummary || '(none)'}\nRecent conversation:\n${memoryInput}`;
-        const memoryAiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-          method: 'POST',
-          headers: { 'x-goog-api-key': GEMINI_API_KEY, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: memoryPrompt }] }], generationConfig: { temperature: 0.2, maxOutputTokens: 180 } })
-        });
-        if (memoryAiRes.ok) {
-          const memoryAiData = await memoryAiRes.json();
+        const memoryResult = await generateWithFallback(GEMINI_API_KEY, [activeModel, ...models], {
+          contents: [{ role: 'user', parts: [{ text: memoryPrompt }] }],
+          generationConfig: { temperature: 0.2, maxOutputTokens: 180 }
+        }, 'memory');
+        if (memoryResult?.ok) {
+          const memoryAiData = memoryResult.data;
           const newSummary = (memoryAiData.candidates?.[0]?.content?.parts || []).map(part => part.text || '').join('').trim().slice(0, 5000);
           if (newSummary) {
             const upsertRes = await fetch(`${base}/rest/v1/chat_memories?on_conflict=anonymous_session_id,profile_id`, {
@@ -124,7 +150,7 @@ export async function handler(event) {
             if (!upsertRes.ok) console.error('Supabase memory save failed:', upsertRes.status, await upsertRes.text());
           }
         } else {
-          console.error('Gemini memory update failed:', memoryAiRes.status, (await memoryAiRes.text()).slice(0, 800));
+          console.error('Gemini memory update failed on all configured models.');
         }
       } catch (memoryError) {
         console.error('Memory update error:', memoryError);
